@@ -1913,6 +1913,10 @@ def admin_kb() -> types.InlineKeyboardMarkup:
         Btn(f"{G['wallet']}  Pᴀʏᴍᴇɴᴛꜱ",     callback_data="adm_payments", style="success"),
     )
     kb.add(
+        Btn("⏹  Rᴜɴɴɪɴɢ Bᴏᴛꜱ",  callback_data="adm_running_bots", style="danger"),
+        Btn("🤖  Bᴏᴛ Mᴀɴᴀɢᴇʀ",   callback_data="adm_bot_manager",  style="primary"),
+    )
+    kb.add(
         Btn(f"{G['broadcast']}  Bʀᴏᴀᴅᴄᴀꜱᴛ", callback_data="adm_broadcast",style="success"),
         Btn(f"{G['no']}  Bᴀɴ / Uɴʙᴀɴ",      callback_data="adm_ban",      style="danger"),
     )
@@ -5770,6 +5774,16 @@ def render_admin_subroute(call: types.CallbackQuery, data: str) -> None:
         return render_adm_users(call)
     if data == "adm_allbots":
         return render_adm_allbots(call)
+    if data == "adm_running" or data == "adm_running_bots":
+        return render_adm_running_bots(call, 0)
+    if data.startswith("adm_running_"):
+        try:
+            pg = int(data[len("adm_running_"):])
+        except Exception:
+            pg = 0
+        return render_adm_running_bots(call, pg)
+    if data.startswith("adm_fstop_"):
+        return action_adm_force_stop(call, data[len("adm_fstop_"):])
     if data == "adm_payments":
         return render_adm_payments(call)
     if data == "adm_broadcast":
@@ -6551,20 +6565,189 @@ def render_adm_users(call: types.CallbackQuery) -> None:
     show_menu(call.message.chat.id, PHOTOS["admin"], cap, back_admin_kb(), call=call)
 
 
+
+def render_adm_running_bots(call: types.CallbackQuery, page: int = 0) -> None:
+    """Admin panel: list currently RUNNING user bots with Stop buttons."""
+    if not is_admin(call.from_user.id):
+        ack(call, "Admin only"); return
+
+    running = []
+    for bid, info in list(RUNNING.items()):
+        try:
+            proc = info.get("proc")
+            if proc is not None and proc.poll() is None:
+                running.append((bid, info))
+        except Exception:
+            continue
+
+    per_page = 10
+    total = len(running)
+    pages = max(1, (total + per_page - 1) // per_page)
+    page = max(0, min(page, pages - 1))
+    chunk = running[page * per_page : (page + 1) * per_page]
+
+    rows = []
+    for bid, info in chunk:
+        b = find_bot(bid) or {}
+        name = esc((b.get("name") or info.get("name") or bid)[:18])
+        owner = b.get("owner") or info.get("owner") or "?"
+        started = info.get("started") or info.get("start_ts") or 0
+        try:
+            up_s = int(time.time() - float(started)) if started else 0
+            if up_s > 3600:
+                uptime = f"{up_s // 3600}h{(up_s % 3600) // 60}m"
+            elif up_s > 60:
+                uptime = f"{up_s // 60}m{up_s % 60}s"
+            else:
+                uptime = f"{up_s}s"
+        except Exception:
+            uptime = "—"
+        rows.append(
+            f"{G['bullet']} <b>{name}</b> <code>{bid[:8]}</code>\n"
+            f"   uid <code>{owner}</code> · up {uptime}"
+        )
+
+    body = "\n".join(rows) if rows else f"<i>{sc('No bots running right now')}</i>"
+    cap = (
+        f"<b>⏹ {sc('Running Bots')} ({total})</b>\n"
+        f"{G['div_eq']}\n"
+        f"{body}\n"
+        f"{G['div']}\n"
+        f"<i>{sc('Tap Stop to force-stop a user bot')}</i>\n"
+        f"Page {page + 1}/{pages}{FOOTER}"
+    )
+
+    kb = types.InlineKeyboardMarkup(row_width=1)
+    for bid, info in chunk:
+        b = find_bot(bid) or {}
+        name = (b.get("name") or bid)[:16]
+        owner = b.get("owner") or info.get("owner") or "?"
+        kb.add(Btn(
+            f"⏹ Stop · {name} · uid {owner}",
+            callback_data=f"adm_fstop_{bid}",
+            style="danger",
+        ))
+
+    nav = []
+    if page > 0:
+        nav.append(Btn("◀ Prev", callback_data=f"adm_running_{page - 1}", style="primary"))
+    if page < pages - 1:
+        nav.append(Btn("Next ▶", callback_data=f"adm_running_{page + 1}", style="primary"))
+    if nav:
+        kb.row(*nav)
+
+    kb.add(Btn("🔄 Refresh", callback_data=f"adm_running_{page}", style="success"))
+    kb.add(Btn("🔴 Kill ALL Running", callback_data="adm_kill_all_now", style="danger"))
+    kb.add(Btn(f"{G['back']}  Bot Manager", callback_data="adm_bot_manager", style="primary"))
+    kb.add(Btn(f"{G['back']}  Admin", callback_data="menu_admin", style="primary"))
+
+    show_menu(call.message.chat.id, PHOTOS.get("admin", PHOTOS.get("bot", "")), cap, kb, call=call)
+
+
+def action_adm_force_stop(call: types.CallbackQuery, bot_id: str) -> None:
+    """Owner/Admin force-stops any user's running bot."""
+    if not is_admin(call.from_user.id):
+        ack(call, "Admin only"); return
+
+    b = find_bot(bot_id)
+    info = RUNNING.get(bot_id)
+    if not info and not b:
+        ack(call, "Bot not found")
+        return render_adm_running_bots(call)
+
+    # Already stopped?
+    try:
+        if info and info.get("proc") is not None and info["proc"].poll() is not None:
+            RUNNING.pop(bot_id, None)
+            ack(call, "Already stopped")
+            return render_adm_running_bots(call)
+        if not info or info.get("proc") is None:
+            ack(call, "Not running")
+            return render_adm_running_bots(call)
+    except Exception:
+        pass
+
+    name = (b or {}).get("name") or bot_id
+    owner = (b or {}).get("owner") or (info or {}).get("owner") or "?"
+
+    loading(call, f"Stopping {name}")
+    try:
+        res = stop_child(bot_id, manual=True)
+    except Exception as e:
+        ack(call, f"Error: {e}")
+        return render_adm_running_bots(call)
+
+    audit(
+        call.from_user.id,
+        "adm_force_stop",
+        f"bot={bot_id} owner={owner} name={name}",
+    )
+
+    # Notify the bot owner
+    try:
+        if owner and str(owner).isdigit():
+            bot.send_message(
+                int(owner),
+                f"<b>⏹ Admin မှ Bot ရပ်လိုက်သည်</b>\n"
+                f"{G['div']}\n"
+                f"{bullet('Bot', name)}\n"
+                f"{bullet('ID', bot_id)}\n"
+                f"<i>Admin/Owner က force-stop လုပ်ထားသည်။</i>",
+                parse_mode="HTML",
+            )
+    except Exception:
+        pass
+
+    ack(call, f"Stopped {name}")
+    try:
+        notify_owner(
+            f"<b>⏹ Admin Force-Stop</b>\n"
+            f"{bullet('Admin', call.from_user.id)}\n"
+            f"{bullet('Bot', name)}\n"
+            f"{bullet('Bot ID', bot_id)}\n"
+            f"{bullet('Owner', owner)}"
+        )
+    except Exception:
+        pass
+
+    return render_adm_running_bots(call)
+
+
+
 def render_adm_allbots(call: types.CallbackQuery) -> None:
     d = db_load()["bots"]
     items = list(d.values())[:25]
     rows = "\n".join(
         f"{G['bullet']} <code>{b['_id']}</code> — {esc(b['name'])} "
         f"{G['bullet']} <i>uid {b['owner']}</i> "
-        f"{G['bullet']} {'run' if b['_id'] in RUNNING and RUNNING[b['_id']]['proc'].poll() is None else 'idle'}"
+        f"{G['bullet']} {'▶ run' if b['_id'] in RUNNING and RUNNING[b['_id']]['proc'].poll() is None else '■ idle'}"
         for b in items
     ) or f"<i>{sc('no bots')}</i>"
     cap = (
         f"<b>{G['diamond']} {sc('All Bots')} ({len(d)})</b>\n"
-        f"{G['div_eq']}\n{rows}\n{G['div']}{FOOTER}"
+        f"{G['div_eq']}\n{rows}\n{G['div']}\n"
+        f"<i>Running bots ကို ရပ်ရန် ⏹ Running Bots ကို နှိပ်ပါ</i>{FOOTER}"
     )
-    show_menu(call.message.chat.id, PHOTOS["admin"], cap, back_admin_kb(), call=call)
+    kb = types.InlineKeyboardMarkup(row_width=1)
+    # Quick-stop buttons for currently running bots (max 8)
+    n_btn = 0
+    for b in items:
+        bid = b["_id"]
+        try:
+            if bid in RUNNING and RUNNING[bid]["proc"].poll() is None:
+                kb.add(Btn(
+                    f"⏹ Stop · {b.get('name', bid)[:16]} · uid {b.get('owner')}",
+                    callback_data=f"adm_fstop_{bid}",
+                    style="danger",
+                ))
+                n_btn += 1
+                if n_btn >= 8:
+                    break
+        except Exception:
+            continue
+    kb.add(Btn("⏹  All Running Bots", callback_data="adm_running_bots", style="danger"))
+    kb.add(Btn(f"{G['back']}  Admin", callback_data="menu_admin", style="primary"))
+    show_menu(call.message.chat.id, PHOTOS["admin"], cap, kb, call=call)
 
 
 def render_adm_payments(call: types.CallbackQuery) -> None:
@@ -7370,8 +7553,12 @@ def render_adm_bot_manager(call: types.CallbackQuery) -> None:
     )
     kb = types.InlineKeyboardMarkup(row_width=2)
     kb.add(
-        Btn("💥  Cʀᴀꜱʜᴇᴅ Bᴏᴛꜱ",     callback_data="adm_crashed_bots",        style="danger"),
+        Btn("⏹  Rᴜɴɴɪɴɢ Bᴏᴛꜱ",      callback_data="adm_running_bots",        style="danger"),
         Btn("🔄  Rᴇꜱᴛᴀʀᴛ Sᴛᴏᴘᴘᴇᴅ",   callback_data="adm_mass_restart_stopped", style="success"),
+    )
+    kb.add(
+        Btn("💥  Cʀᴀꜱʜᴇᴅ Bᴏᴛꜱ",     callback_data="adm_crashed_bots",        style="danger"),
+        Btn("📋  Aʟʟ Bᴏᴛꜱ",          callback_data="adm_allbots",             style="primary"),
     )
     kb.add(
         Btn("🔍  Sᴇᴀʀᴄʜ Bᴏᴛ",        callback_data="adm_bot_search",          style="primary"),
@@ -16536,17 +16723,37 @@ def render_adm_allbots(call: types.CallbackQuery) -> None:
     d = db_load()["bots"]
     items = list(d.values())[:25]
     rows = "\n".join(
-        f"{G['bullet']} <code>{b['_id']}</code> \u2014 {esc(b['name'])} "
+        f"{G['bullet']} <code>{b['_id']}</code> — {esc(b['name'])} "
         f"{G['bullet']} uid {b['owner']} "
-        f"{'&#x25B6;' if b['_id'] in RUNNING and RUNNING[b['_id']]['proc'].poll() is None else '&#x23F9;'}"
+        f"{'▶' if b['_id'] in RUNNING and RUNNING[b['_id']]['proc'].poll() is None else '■'}"
         f"{' 🐙' if b.get('source') in ('github','github_browser') else ''}"
         for b in items
     ) or f"<i>{sc('no bots')}</i>"
     cap = (
         f"<b>{G['diamond']} {sc('All Bots')} ({len(d)})</b>\n"
-        f"{G['div_eq']}\n{rows}\n{G['div']}{FOOTER}"
+        f"{G['div_eq']}\n{rows}\n{G['div']}\n"
+        f"<i>Running bots ရပ်ရန် ⏹ ကို နှိပ်ပါ</i>{FOOTER}"
     )
-    show_menu(call.message.chat.id, PHOTOS["admin"], cap, back_admin_kb(), call=call)
+    kb = types.InlineKeyboardMarkup(row_width=1)
+    n_btn = 0
+    for b in items:
+        bid = b["_id"]
+        try:
+            if bid in RUNNING and RUNNING[bid]["proc"].poll() is None:
+                kb.add(Btn(
+                    f"⏹ Stop · {str(b.get('name', bid))[:16]} · uid {b.get('owner')}",
+                    callback_data=f"adm_fstop_{bid}",
+                    style="danger",
+                ))
+                n_btn += 1
+                if n_btn >= 8:
+                    break
+        except Exception:
+            continue
+    kb.add(Btn("⏹  All Running Bots", callback_data="adm_running_bots", style="danger"))
+    kb.add(Btn(f"{G['back']}  Admin", callback_data="menu_admin", style="primary"))
+    show_menu(call.message.chat.id, PHOTOS["admin"], cap, kb, call=call)
+
 
 
 def render_adm_payments(call: types.CallbackQuery) -> None:
@@ -17009,6 +17216,16 @@ def render_admin_subroute(call: types.CallbackQuery, data: str) -> None:
     if data == "adm_stats":              return render_adm_stats(call)
     if data == "adm_users":              return render_adm_users(call)
     if data == "adm_allbots":            return render_adm_allbots(call)
+    if data == "adm_running" or data == "adm_running_bots":
+        return render_adm_running_bots(call, 0)
+    if data.startswith("adm_running_"):
+        try:
+            pg = int(data[len("adm_running_"):])
+        except Exception:
+            pg = 0
+        return render_adm_running_bots(call, pg)
+    if data.startswith("adm_fstop_"):
+        return action_adm_force_stop(call, data[len("adm_fstop_"):])
     if data == "adm_payments":           return render_adm_payments(call)
     if data == "adm_broadcast":          return render_adm_broadcast(call)
     if data == "adm_ban":                return render_adm_ban(call)
