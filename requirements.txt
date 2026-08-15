@@ -8,3 +8,5 @@ psutil
 Pillow
 curl_cffi
 google-generativeai
+git+https://github.com/openai/whisper.git
+
